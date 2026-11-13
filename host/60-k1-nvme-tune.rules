@@ -1,0 +1,4 @@
+# bpi-f3-frigate-ha: turn off NVMe power saving (APST, ASPM L1) as soon as each NVMe disk appears,
+# at boot (coldplug) and on hotplug alike. It matches the disk, not the controller: the driver
+# creates the APST knob (power/pm_qos_latency_tolerance_us) only after it has identified the drive.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="nvme[0-9]*n[0-9]*", RUN+="/usr/local/sbin/k1-nvme-tune"

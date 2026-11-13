@@ -29,8 +29,14 @@ ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)")
 if [[ "$(basename "$DEV")" == nvme* ]]; then
   log "NVMe: disabling power saving (APST, ASPM L1) now and on every boot"
   install -m 755 "$STACK/host/k1-nvme-tune" /usr/local/sbin/k1-nvme-tune
-  install -m 644 "$STACK/host/k1-nvme-tune.service" /etc/systemd/system/k1-nvme-tune.service
-  systemctl daemon-reload && systemctl enable k1-nvme-tune.service >/dev/null
+  install -m 644 "$STACK/host/60-k1-nvme-tune.rules" /etc/udev/rules.d/60-k1-nvme-tune.rules
+  udevadm control --reload
+  # older versions used a systemd service, which at cold boot could run before the disk showed up
+  if [ -e /etc/systemd/system/k1-nvme-tune.service ]; then
+    systemctl disable k1-nvme-tune.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/k1-nvme-tune.service
+    systemctl daemon-reload
+  fi
   /usr/local/sbin/k1-nvme-tune
   # the weekly fstrim would issue a bulk TRIM, which hangs the controller
   systemctl disable --now fstrim.timer >/dev/null 2>&1 || true

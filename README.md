@@ -96,8 +96,8 @@ kernel. I haven't tried them.
    - moves Docker's data root there;
    - moves `deploy/data` and `deploy/homeassistant` there, leaving symlinks behind.
 
-   For an NVMe drive it also installs a small service that turns off the drive's power saving at
-   every boot (see [Known problems](#known-problems)).
+   For an NVMe drive it also installs a udev rule that turns off the drive's power saving whenever
+   the drive appears (see [Known problems](#known-problems)).
 
 5. Build the images:
 
@@ -232,7 +232,8 @@ In case you're doing something similar on this chip:
 
 **NVMe drives can hang under load.** The kernel log shows `nvme nvme0: I/O tag … QID 0 timeout,
 disable controller`. Turning off the drive's power saving (APST) and PCIe link power management
-(ASPM L1) fixes it. `use-disk.sh` sets that up as a service.
+(ASPM L1) fixes it. `use-disk.sh` installs a udev rule that does this every time the drive shows up.
+Check it after a reboot with `journalctl -b -t k1-nvme-tune`.
 
 It also formats without TRIM and disables the weekly `fstrim.timer`, because a big TRIM triggers
 the same hang.
