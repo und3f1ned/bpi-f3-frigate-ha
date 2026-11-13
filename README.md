@@ -22,7 +22,7 @@ Yes, on my board, as of November 2026:
 
 | | |
 |---|---|
-| Board | BPI-F3, 4 GB RAM, NVMe SSD in the M.2 slot |
+| Board | BPI-F3, 4 GB RAM, NVMe SSD in the M.2 slot (since replaced, see [NVMe](#nvme-is-not-reliable-on-this-board)) |
 | OS | Armbian (Debian trixie), `current` kernel 6.18 for spacemit |
 | Frigate | 0.18.2 |
 | Home Assistant | 2026.11.1 (Python 3.14) |
@@ -45,7 +45,9 @@ kernel. I haven't tried them.
 - **Armbian with the `current` (or `legacy`) kernel for spacemit.** Those kernels carry SpacemiT's
   vendor drivers for the VPU and for the NPU's memory (TCM). The `edge` kernel is mainline, has
   neither, and won't work.
-- **An external disk:** NVMe in the M.2 slot or a USB SSD.
+- **An external disk.** Use a SATA drive behind an M.2-to-SATA adapter (JMB582 or similar) in the
+  M.2 slot, or a USB SSD. **Avoid NVMe** on this board, see
+  [NVMe is not reliable on this board](#nvme-is-not-reliable-on-this-board).
   - The images take about 5 GB, and building Frigate needs another 7–8 GB of scratch space.
   - Recordings need room too.
   - A 16 GB microSD is too small, and recording to it will wear it out quickly.
@@ -85,7 +87,7 @@ kernel. I haven't tried them.
 4. Move Docker and the stack's data to the external disk. Find the disk with `lsblk`, then:
 
    ```bash
-   sudo ./host/use-disk.sh /dev/nvme0n1 --format
+   sudo ./host/use-disk.sh /dev/sda --format
    ```
 
    `--format` **erases the whole disk.** To use an existing partition, leave it off and pass the
@@ -96,8 +98,11 @@ kernel. I haven't tried them.
    - moves Docker's data root there;
    - moves `deploy/data` and `deploy/homeassistant` there, leaving symlinks behind.
 
-   For an NVMe drive it also installs a udev rule that turns off the drive's power saving whenever
-   the drive appears (see [Known problems](#known-problems)).
+   It also makes Docker depend on that mount. If the disk is missing at boot, Docker stays down
+   instead of quietly starting with an empty data root on the microSD.
+
+   If you use an NVMe drive anyway, the script prints a warning and applies the workarounds
+   described in [Known problems](#nvme-is-not-reliable-on-this-board).
 
 5. Build the images:
 
@@ -230,22 +235,45 @@ In case you're doing something similar on this chip:
 
 ## Known problems
 
-**NVMe drives can hang under load.** The kernel log shows `nvme nvme0: I/O tag … QID 0 timeout,
-disable controller`. Turning off the drive's power saving (APST) and PCIe link power management
-(ASPM L1) fixes it. `use-disk.sh` installs a udev rule that does this every time the drive shows up.
-Check it after a reboot with `journalctl -b -t k1-nvme-tune`.
+### NVMe is not reliable on this board
 
-It also formats without TRIM and disables the weekly `fstrim.timer`, because a big TRIM triggers
-the same hang.
+I ran the stack from a Patriot P300 (MAXIO MAP1202 controller) in the M.2 slot for a while and gave
+up on it. Don't use NVMe here unless you're fine with the disk possibly not showing up after the
+next reboot.
+
+What I saw:
+
+- **Hangs under load.** The kernel logs `nvme nvme0: I/O tag … QID 0 timeout, disable controller`.
+  It happened during `mkfs`, which TRIMs the whole disk by default.
+- **The drive didn't come back after a reboot.** The controller never became ready
+  (`nvme nvme0: Device not ready; aborting initialisation, CSTS=0x0`), and pulling the power for
+  30 seconds didn't help either. The same drive worked fine in a USB enclosure on another machine,
+  so the drive itself was OK. The K1's PCIe driver doesn't control the M.2 slot's power
+  (`has no power on gpio` in the log). My guess is that the drive needs a power and reset sequence
+  the board doesn't give it.
+
+`use-disk.sh` still has workarounds for NVMe, and it prints a warning when you point it at one:
+- it turns off the drive's power saving (APST) and the PCIe link's (ASPM L1) from a udev rule
+  every time the drive appears (`journalctl -b -t k1-nvme-tune` shows it ran);
+- it formats without TRIM and disables the weekly `fstrim.timer`.
+
+They made the hangs under load go away for me, but they didn't stop the drive from getting stuck
+after a reboot.
+
+I'm moving my board to a JMB582 M.2-to-SATA adapter with SATA drives. With SATA none of these
+workarounds apply: TRIM and power management stay at their defaults. I'll update this section
+once that setup has run for a while.
 
 > [!WARNING]
 > Do not add `pcie_aspm=off` or `nvme_core.default_ps_max_latency_us=0` to
 > `/boot/extlinux/extlinux.conf`. With these parameters, this kernel doesn't boot. If you already
 > did, put the microSD in another computer and remove them.
 
-**Cold boot takes about 5 minutes.** Roughly two of those are a pause in the initramfs. A warm
-reboot takes about 20 seconds. I haven't found the cause. It doesn't affect anything once the board
-is up.
+### Other known problems
+
+**Booting can take about 5 minutes.** About two of those are a pause in the initramfs before the
+root filesystem on the microSD is mounted. It isn't related to the external disk, and I haven't
+found the cause. It doesn't affect anything once the board is up.
 
 **The VPU decoder hangs at end of stream.** Cameras never end, so in practice this only matters
 for files. Loop them through go2rtc, as the test camera does.

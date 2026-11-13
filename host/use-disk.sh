@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Moves Docker data (images, build cache) and stack data (camera recordings, HA config and database)
-# from the microSD card to an external disk (USB or NVMe in the M.2 slot).
+# from the microSD card to an external disk: a SATA drive behind an M.2-to-SATA adapter (JMB582
+# and the like) or a USB SSD. NVMe works but is not recommended on the K1, see the README.
 #
 #   sudo ./host/use-disk.sh /dev/sda1                 # existing partition (ext4/xfs/btrfs)
 #   sudo ./host/use-disk.sh /dev/sda --format         # WIPE the whole disk: GPT + one ext4 partition
@@ -26,7 +27,10 @@ ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)")
 [ "$(lsblk -no PKNAME "$DEV" 2>/dev/null || true)" != "$ROOT_DISK" ] && [ "$(basename "$DEV")" != "$ROOT_DISK" ] \
   || die "$DEV is the system disk"
 
-if [[ "$(basename "$DEV")" == nvme* ]]; then
+NVME=0; [[ "$(basename "$DEV")" == nvme* ]] && NVME=1
+if [ "$NVME" = 1 ]; then
+  echo "WARNING: NVMe on the SpacemiT K1 is unreliable: drives hang under load and may not come back" >&2
+  echo "         after a reboot, even after a power cycle. A SATA drive behind a JMB582 is safer." >&2
   log "NVMe: disabling power saving (APST, ASPM L1) now and on every boot"
   install -m 755 "$STACK/host/k1-nvme-tune" /usr/local/sbin/k1-nvme-tune
   install -m 644 "$STACK/host/60-k1-nvme-tune.rules" /etc/udev/rules.d/60-k1-nvme-tune.rules
@@ -51,8 +55,12 @@ if [ "$FORMAT" = 1 ]; then
   printf 'label: gpt\n,,L\n' | sfdisk -q "$DEV"
   partprobe "$DEV" 2>/dev/null || true; udevadm settle; sleep 1
   DEV=$(lsblk -lnpo NAME "$DEV" | sed -n 2p)
-  # no whole-disk TRIM: some NVMe drives on the K1 hang during a long discard
-  mkfs.ext4 -q -F -E nodiscard -L k1data "$DEV"
+  if [ "$NVME" = 1 ]; then
+    # no whole-disk TRIM: NVMe drives on the K1 can hang during a long discard
+    mkfs.ext4 -q -F -E nodiscard -L k1data "$DEV"
+  else
+    mkfs.ext4 -q -F -L k1data "$DEV"
+  fi
 fi
 
 UUID=$(blkid -s UUID -o value "$DEV"); FSTYPE=$(blkid -s TYPE -o value "$DEV")
@@ -86,6 +94,12 @@ PY
   systemctl start docker
   docker info -f 'Docker Root Dir: {{.DockerRootDir}}'
 fi
+
+# If the disk doesn't show up at boot (nofail lets the board boot anyway), Docker must not start:
+# it would quietly create an empty data root on the microSD and none of the containers would run.
+mkdir -p /etc/systemd/system/docker.service.d
+printf '[Unit]\nRequiresMountsFor=%s/docker\n' "$MNT" > /etc/systemd/system/docker.service.d/k1-data-disk.conf
+systemctl daemon-reload
 
 log "Moving stack data (recordings, HA database) to the disk"
 for d in data homeassistant; do
