@@ -1,0 +1,15 @@
+#!/bin/sh
+# Disables NVMe power saving on the BPI-F3 (SpacemiT K1): the drive's APST and the PCIe link's ASPM L1.
+# Without this the NVMe controller (tested with a Patriot P300) can hang:
+#   "nvme nvme0: I/O tag ... QID 0 timeout, disable controller".
+# The kernel parameters pcie_aspm=off / nvme_core.default_ps_max_latency_us=0 break booting on the
+# current-spacemit kernel, so this is set at runtime. Run by k1-nvme-tune.service.
+for c in /sys/class/nvme/nvme*; do
+  [ -e "$c" ] || continue
+  # 0 => the driver disables APST (Autonomous Power State Transition)
+  [ -w "$c/power/pm_qos_latency_tolerance_us" ] && echo 0 > "$c/power/pm_qos_latency_tolerance_us"
+  pci=$(readlink -f "$c/device")
+  [ -w "$pci/link/l1_aspm" ] && echo 0 > "$pci/link/l1_aspm"
+  echo "$(basename "$c"): APST and ASPM L1 disabled"
+done
+exit 0

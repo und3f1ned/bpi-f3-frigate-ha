@@ -1,0 +1,65 @@
+# Smart home stack on the BPI-F3 (SpacemiT K1): Home Assistant, Frigate, AI accelerator detector, MQTT.
+# Images are built by ../build.sh. Start: docker compose up -d   (from this directory)
+name: k1
+services:
+  # YOLOv8n INT8 detector on SpaceMIT EP (cores 0-3); Frigate talks to it over ZMQ via ./data/run
+  k1det:
+    image: k1/k1det:latest
+    container_name: k1det
+    restart: unless-stopped
+    devices:
+      - /dev/tcm:/dev/tcm
+      - /dev/udma:/dev/udma
+    volumes:
+      - ./data/models:/models
+      - ./data/run:/run/k1det
+
+  mosquitto:
+    image: k1/mosquitto:latest
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./data/mosquitto:/mosquitto/data
+
+  frigate:
+    image: k1/frigate:latest
+    container_name: frigate
+    restart: unless-stopped
+    depends_on: [k1det, mosquitto]
+    shm_size: "256mb"
+    devices:
+      - /dev/video0:/dev/video0                         # Linlon VPU (stcodec decoder)
+      - /dev/dma_heap/linux,cma:/dev/dma_heap/linux,cma # MPP buffers
+      - /dev/dma_heap/system:/dev/dma_heap/system
+    environment:
+      FRIGATE_RTSP_PASSWORD: ${FRIGATE_RTSP_PASSWORD:-}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./frigate:/config
+      - ./data/models:/config/model:ro
+      - ./data/media:/media/frigate      # recordings: better on SSD/HDD than on microSD
+      - ./data/run:/run/k1det
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 268435456
+    ports:
+      - "8971:8971"        # web UI with auth (admin password is in the log on first start)
+      - "5000:5000"        # unauthenticated API for Home Assistant; don't expose it outside
+      - "8554:8554"
+      - "8555:8555/tcp"
+      - "8555:8555/udp"
+
+  homeassistant:
+    image: k1/homeassistant:latest
+    container_name: homeassistant
+    restart: unless-stopped
+    network_mode: host     # device discovery (mDNS, SSDP); web: http://<board>:8123
+    cap_add: [NET_ADMIN, NET_RAW]   # Bluetooth: adapter recovery (as in the HA docs)
+    volumes:
+      - ./homeassistant:/config
+      - ./data/ha-cache:/root/.cache   # uv cache: packages compiled when integrations get enabled
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro   # host Bluetooth via D-Bus

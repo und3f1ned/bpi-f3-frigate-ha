@@ -1,0 +1,63 @@
+mqtt:
+  enabled: true
+  host: mosquitto
+
+detectors:
+  k1:
+    type: zmq                          # external detector: the k1det container (SpaceMIT EP)
+    endpoint: ipc:///run/k1det/zmq
+
+model:
+  # The model file and class list are in ./data/models (k1det puts them there on first start).
+  path: /config/model/yolov8n_320x320.q.onnx
+  labelmap_path: /config/model/coco80.txt
+  model_type: yolo-generic
+  width: 320
+  height: 320
+  input_tensor: nhwc
+  input_pixel_format: rgb
+
+ffmpeg:
+  # Hardware decoding on the K1 VPU (Bianbu's ffmpeg with stcodec is the image default).
+  # For H.265 cameras, set per camera: hwaccel_args: -c:v hevc_stcodec
+  # Don't use the stcodec -scale option: it doesn't work with this kernel and corrupts the picture.
+  hwaccel_args: -c:v h264_stcodec
+
+# Test "camera": a file played in a loop without re-encoding (file_loop input template).
+# Put any H.264 clip at deploy/data/media/test/test_1080p.mp4 (seen as /media/frigate/test/).
+# Replace with your own cameras, for example:
+#   streams:
+#     front: ["rtsp://admin:{FRIGATE_RTSP_PASSWORD}@192.168.1.10:554/stream1"]
+# Frigate strips exec:/echo:/expr: sources by default (GO2RTC_ALLOW_ARBITRARY_EXEC).
+go2rtc:
+  ffmpeg:
+    file_loop: "-re -stream_loop -1 -i {input}"
+  streams:
+    test:
+      - "ffmpeg:/media/frigate/test/test_1080p.mp4#input=file_loop#video=copy"
+
+detect:
+  enabled: true      # off by default in recent Frigate versions (0.18 included)
+
+objects:
+  track: [person, bicycle, car]
+
+record:
+  enabled: false
+
+snapshots:
+  enabled: true
+  retain:
+    default: 1
+
+cameras:
+  test:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/test
+          input_args: preset-rtsp-restream
+          roles: [detect]
+    detect:
+      width: 640
+      height: 360
+      fps: 5

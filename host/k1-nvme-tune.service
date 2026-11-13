@@ -1,0 +1,14 @@
+[Unit]
+Description=bpi-f3-frigate-ha: disable NVMe power saving (APST, ASPM L1) before disks are mounted
+DefaultDependencies=no
+After=systemd-udevd.service systemd-modules-load.service
+Before=local-fs-pre.target
+Wants=local-fs-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/k1-nvme-tune
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs-pre.target
