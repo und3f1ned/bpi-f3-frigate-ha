@@ -5,6 +5,9 @@
 #
 #   sudo ./host/use-disk.sh /dev/sda1                 # existing partition (ext4/xfs/btrfs)
 #   sudo ./host/use-disk.sh /dev/sda --format         # WIPE the whole disk: GPT + one ext4 partition
+#   sudo ./host/use-disk.sh /dev/sda --mirror /dev/sdb --format
+#                                                     # WIPE both disks: RAID1 mirror (mdadm) + ext4
+#   sudo ./host/use-disk.sh /dev/md/k1data            # an existing mirror
 #   (--yes: don't ask for confirmation before formatting)
 #
 # The disk is mounted at /srv/k1 (by UUID, in /etc/fstab with nofail), Docker gets data-root
@@ -17,15 +20,26 @@ log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 [ "$(id -u)" -eq 0 ] || die "run with sudo"
 DEV=${1:-}; shift || true
-FORMAT=0 YES=0
-for a in "$@"; do case "$a" in --format) FORMAT=1 ;; --yes) YES=1 ;; *) die "unknown argument $a" ;; esac; done
+FORMAT=0 YES=0 MIRROR=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --format) FORMAT=1 ;;
+    --yes) YES=1 ;;
+    --mirror) [ -n "${2:-}" ] || die "--mirror needs a second disk"; MIRROR=$2; shift ;;
+    *) die "unknown argument $1" ;;
+  esac
+  shift
+done
 MNT=/srv/k1
 STACK=$(dirname "$(dirname "$(readlink -f "$0")")")
 
-[ -b "$DEV" ] || die "no block device '$DEV' (see lsblk)"
 ROOT_DISK=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)")
-[ "$(lsblk -no PKNAME "$DEV" 2>/dev/null || true)" != "$ROOT_DISK" ] && [ "$(basename "$DEV")" != "$ROOT_DISK" ] \
-  || die "$DEV is the system disk"
+for d in "$DEV" ${MIRROR:+"$MIRROR"}; do
+  [ -b "$d" ] || die "no block device '$d' (see lsblk)"
+  ! lsblk -no PKNAME "$d" 2>/dev/null | grep -qx "$ROOT_DISK" && [ "$(basename "$d")" != "$ROOT_DISK" ] \
+    || die "$d is the system disk"
+done
+[ -z "$MIRROR" ] || [ "$FORMAT" = 1 ] || die "--mirror builds a new mirror and needs --format; pass an existing one as /dev/md/..."
 
 NVME=0; [[ "$(basename "$DEV")" == nvme* ]] && NVME=1
 if [ "$NVME" = 1 ]; then
@@ -46,15 +60,42 @@ if [ "$NVME" = 1 ]; then
   systemctl disable --now fstrim.timer >/dev/null 2>&1 || true
 fi
 
+# first partition of a disk that has just been partitioned
+first_part() { partprobe "$1" 2>/dev/null || true; udevadm settle; sleep 1; lsblk -lnpo NAME "$1" | sed -n 2p; }
+
 if [ "$FORMAT" = 1 ]; then
-  log "Formatting $DEV: ALL data on it will be erased"
-  lsblk -o NAME,SIZE,MODEL,FSTYPE,LABEL,MOUNTPOINTS "$DEV"
+  DISKS=("$DEV"); [ -n "$MIRROR" ] && DISKS+=("$MIRROR")
+  log "Formatting ${DISKS[*]}: ALL data on them will be erased"
+  lsblk -o NAME,SIZE,MODEL,FSTYPE,LABEL,MOUNTPOINTS "${DISKS[@]}"
   if [ "$YES" != 1 ]; then read -r -p "Type 'yes' to continue: " ans; [ "$ans" = "yes" ] || die "cancelled"; fi
-  for p in $(lsblk -lnpo NAME "$DEV" | tail -n +2); do umount "$p" 2>/dev/null || true; done
-  wipefs -a "$DEV"
-  printf 'label: gpt\n,,L\n' | sfdisk -q "$DEV"
-  partprobe "$DEV" 2>/dev/null || true; udevadm settle; sleep 1
-  DEV=$(lsblk -lnpo NAME "$DEV" | sed -n 2p)
+  [ -z "$MIRROR" ] || command -v mdadm >/dev/null \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends mdadm >/dev/null
+  OLD_MD=()   # UUIDs of old RAID arrays on these disks (installing mdadm adds them to mdadm.conf)
+  for d in "${DISKS[@]}"; do
+    for p in $(lsblk -lnpo NAME "$d"); do
+      [ "$(blkid -s TYPE -o value "$p" 2>/dev/null)" = linux_raid_member ] || continue
+      OLD_MD+=("$(blkid -s UUID -o value "$p" | tr -d - | sed 's/.\{8\}/&:/g; s/:$//')")
+    done
+    # old RAID members (e.g. from a Synology) get assembled automatically and keep the disk busy
+    for s in /sys/block/md*/slaves/"$(basename "$d")"*; do
+      if [ -e "$s" ]; then mdadm --stop "/dev/$(basename "$(dirname "$(dirname "$s")")")"; fi
+    done
+    for p in $(lsblk -lnpo NAME "$d" | tail -n +2); do umount "$p" 2>/dev/null || true; wipefs -qa "$p" || true; done
+    wipefs -a "$d"
+  done
+  if [ -n "$MIRROR" ]; then
+    PARTS=()
+    for d in "${DISKS[@]}"; do printf 'label: gpt\n,,R\n' | sfdisk -q "$d"; PARTS+=("$(first_part "$d")"); done
+    wipefs -qa "${PARTS[@]}"   # leftovers of old data where the new partitions start
+    mdadm --create /dev/md/k1data --name=k1data --level=1 --raid-devices=2 --metadata=1.2 --run "${PARTS[@]}" </dev/null
+    for u in "${OLD_MD[@]}"; do sed -i "/^ARRAY .*UUID=$u/d" /etc/mdadm/mdadm.conf; done
+    grep -q "^ARRAY /dev/md/k1data " /etc/mdadm/mdadm.conf || mdadm --detail --brief /dev/md/k1data >> /etc/mdadm/mdadm.conf
+    command -v update-initramfs >/dev/null && update-initramfs -u   # the initramfs carries a copy of mdadm.conf
+    DEV=/dev/md/k1data
+  else
+    printf 'label: gpt\n,,L\n' | sfdisk -q "$DEV"
+    DEV=$(first_part "$DEV")
+  fi
   if [ "$NVME" = 1 ]; then
     # no whole-disk TRIM: NVMe drives on the K1 can hang during a long discard
     mkfs.ext4 -q -F -E nodiscard -L k1data "$DEV"
@@ -75,13 +116,16 @@ systemctl daemon-reload
 findmnt "$MNT" >/dev/null || mount "$MNT"
 df -h "$MNT" | tail -1
 
-if [ "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)" != "$MNT/docker" ]; then
+# read data-root from the config, not from `docker info`: that would wake Docker up via its socket
+DOCKER_ROOT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("data-root", ""))' \
+  /etc/docker/daemon.json 2>/dev/null || true)
+if [ "$DOCKER_ROOT" != "$MNT/docker" ]; then
   log "Moving Docker data to $MNT/docker"
   RUNNING=$(cd "$STACK/deploy" 2>/dev/null && docker compose ps --services --status running || true)
   (cd "$STACK/deploy" 2>/dev/null && docker compose stop) || true
   systemctl stop docker.socket docker
   mkdir -p "$MNT/docker"
-  rsync -aHAX --info=progress2 /var/lib/docker/ "$MNT/docker/"
+  [ -d /var/lib/docker ] && rsync -aHAX --info=progress2 /var/lib/docker/ "$MNT/docker/"
   python3 - "$MNT/docker" <<'PY'
 import json, os, sys
 p = "/etc/docker/daemon.json"
@@ -90,7 +134,7 @@ cfg["data-root"] = sys.argv[1]
 os.makedirs("/etc/docker", exist_ok=True)
 json.dump(cfg, open(p, "w"), indent=2)
 PY
-  mv /var/lib/docker /var/lib/docker.old
+  [ -d /var/lib/docker ] && mv /var/lib/docker /var/lib/docker.old
   systemctl start docker
   docker info -f 'Docker Root Dir: {{.DockerRootDir}}'
 fi
@@ -114,4 +158,11 @@ ls -l "$STACK/deploy"
 # start what was running before the move (other images may not be built yet)
 [ -n "${RUNNING:-}" ] && (cd "$STACK/deploy" && docker compose up -d $RUNNING) || true
 
-log "Done. Once you're sure everything works: sudo rm -rf /var/lib/docker.old"
+# TRIM is fine on SATA and USB SSDs; turn the weekly fstrim back on if an earlier NVMe setup disabled it
+[ "$NVME" = 1 ] || systemctl enable --now fstrim.timer >/dev/null 2>&1 || true
+
+if [ -d /var/lib/docker.old ]; then
+  log "Done. Once you're sure everything works: sudo rm -rf /var/lib/docker.old"
+else
+  log "Done"
+fi

@@ -22,7 +22,8 @@ Yes, on my board, as of November 2026:
 
 | | |
 |---|---|
-| Board | BPI-F3, 4 GB RAM, NVMe SSD in the M.2 slot (since replaced, see [NVMe](#nvme-is-not-reliable-on-this-board)) |
+| Board | BPI-F3, 4 GB RAM |
+| Storage | two SATA SSDs in a RAID1 mirror behind a JMB582 M.2-to-SATA adapter (an NVMe SSD before that, see [NVMe](#nvme-is-not-reliable-on-this-board)) |
 | OS | Armbian (Debian trixie), `current` kernel 6.18 for spacemit |
 | Frigate | 0.18.2 |
 | Home Assistant | 2026.11.1 (Python 3.14) |
@@ -92,6 +93,16 @@ kernel. I haven't tried them.
 
    `--format` **erases the whole disk.** To use an existing partition, leave it off and pass the
    partition instead, e.g. `/dev/sda1`.
+
+   With two disks (a JMB582 has two SATA ports), make a mirror. If one disk dies, nothing is lost:
+
+   ```bash
+   sudo ./host/use-disk.sh /dev/sda --mirror /dev/sdb --format
+   ```
+
+   That **erases both disks**, builds a RAID1 array with `mdadm` and puts ext4 on it. Leftover RAID
+   members from an old NAS (Synology and the like) are stopped and cleaned up. The first sync runs in
+   the background, about 20 minutes for 240 GB SSDs. The array is usable during that time.
 
    The script:
    - mounts the disk at `/srv/k1`;
@@ -260,9 +271,18 @@ What I saw:
 They made the hangs under load go away for me, but they didn't stop the drive from getting stuck
 after a reboot.
 
-I'm moving my board to a JMB582 M.2-to-SATA adapter with SATA drives. With SATA none of these
-workarounds apply: TRIM and power management stay at their defaults. I'll update this section
-once that setup has run for a while.
+My board now runs from a JMB582 M.2-to-SATA adapter with two SATA SSDs in a mirror. The kernel's
+built-in AHCI driver handles the adapter (it shows up as a JMB585, `197b:0585`, on a PCIe Gen2 x1
+link). None of the NVMe workarounds apply there: TRIM and power management stay at their defaults.
+
+To move off NVMe without rebuilding anything:
+1. Set up the new disks with `use-disk.sh`.
+2. Put the old NVMe drive in a USB enclosure and plug it into the board.
+3. Stop Docker, mount the old drive read-only and copy it over:
+
+   ```bash
+   rsync -aHAX --numeric-ids --exclude /lost+found /mnt/old/ /srv/k1/
+   ```
 
 > [!WARNING]
 > Do not add `pcie_aspm=off` or `nvme_core.default_ps_max_latency_us=0` to
